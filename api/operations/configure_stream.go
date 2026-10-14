@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"net/http"
@@ -46,6 +47,11 @@ func NewConfigureStreamUsecase(deps ConfigureStreamDeps) usecase.Interactor {
 			) error {
 				err := deps.LogStorage.ConfigureStream(ctx, req.Stream, req.Config)
 				if err != nil {
+					if errors.Is(err, storage.ErrStreamRetiring) {
+						resp.Success = false
+						return status.Wrap(err, status.FailedPrecondition)
+					}
+
 					deps.Logger.ErrorContext(
 						ctx,
 						"Failed to configure stream",
@@ -68,7 +74,7 @@ func NewConfigureStreamUsecase(deps ConfigureStreamDeps) usecase.Interactor {
 	u.SetDescription("Configure Stream retention and indexes")
 	u.SetTags("streams")
 
-	u.SetExpectedErrors(status.PermissionDenied, status.Internal)
+	u.SetExpectedErrors(status.PermissionDenied, status.FailedPrecondition, status.Internal)
 
 	return u
 }

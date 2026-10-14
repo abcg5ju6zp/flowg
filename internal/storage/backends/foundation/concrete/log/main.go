@@ -29,6 +29,9 @@ type Options struct {
 	// BatchSize bounds how many keys whole-stream operations touch per
 	// transaction; zero uses the storage default.
 	BatchSize int
+	// DrainTimeout bounds how long a purge waits for in-flight writes to
+	// finish; zero uses the storage default.
+	DrainTimeout time.Duration
 	// StreamConfigOverride, when not nil, is used as the configuration of every
 	// stream instead of the stored one.
 	StreamConfigOverride *models.StreamConfig
@@ -72,12 +75,24 @@ func Module() fx.Option {
 		"storage.log",
 		foundation.NewAdapter("storage.log", Options.adapterOptions),
 		fx.Provide(func(lc fx.Lifecycle, d deps) storage.LogStorage {
-			storage := log.NewStorage(d.Logger, d.Adapter, d.Options.BatchSize, d.Options.StreamConfigOverride)
+			storage := log.NewStorage(
+				d.Logger,
+				d.Adapter,
+				d.Options.BatchSize,
+				d.Options.DrainTimeout,
+				d.Options.StreamConfigOverride,
+			)
 
 			gc := actor.New(log.NewGarbageCollector(storage, d.Options.GCInterval))
 
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
+					// Resume any purge a previous process did not finish before
+					// any service accepts traffic or the GC starts sweeping.
+					if err := storage.RecoverRetirements(ctx); err != nil {
+						return err
+					}
+
 					gc.Start()
 					return nil
 				},

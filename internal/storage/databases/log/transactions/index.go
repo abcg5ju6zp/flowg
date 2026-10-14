@@ -40,7 +40,16 @@ func IndexFieldBatch(
 	field string,
 	cursor kv.Key,
 	limit int,
+	expectedGeneration uint64,
 ) (kv.Key, int, error) {
+	// The maintenance is bound to the generation observed by the configuration
+	// change that started it: a purge of that generation (or a same-name
+	// rebuild after it) aborts the back-fill before this batch can touch the
+	// next lineage's keyspace.
+	if err := guardMaintenanceGeneration(txn, stream, expectedGeneration); err != nil {
+		return nil, 0, err
+	}
+
 	var last kv.Key
 	processed := 0
 
@@ -86,8 +95,21 @@ func IndexFieldBatch(
 // UnindexFieldBatch drops up to limit keys of a field's inverted index
 // ("index:<stream>:field:<field>:*") and reports how many it deleted. A count
 // below limit means the index has been fully removed. Callers loop until it
-// returns zero so the work stays within the backend's transaction limits.
-func UnindexFieldBatch(txn kv.MutationTx, stream string, field string, limit int) (int, error) {
+// returns zero so the work stays within the transaction limits.
+//
+// Like IndexFieldBatch it is bound to the configuration change's generation,
+// so a stale removal cannot delete index keys of a rebuilt generation.
+func UnindexFieldBatch(
+	txn kv.MutationTx,
+	stream string,
+	field string,
+	limit int,
+	expectedGeneration uint64,
+) (int, error) {
+	if err := guardMaintenanceGeneration(txn, stream, expectedGeneration); err != nil {
+		return 0, err
+	}
+
 	var keys []kv.Key
 	for key := range txn.IterKeys(kv.Key{"index", stream, "field", field}, kv.KeyRange{}) {
 		keys = append(keys, key)

@@ -26,7 +26,7 @@ func TestLogNotifier(t *testing.T) {
 	app.RequireStart()
 	defer app.RequireStop()
 
-	logM, err := notifier.Subscribe(t.Context(), "test")
+	logM, err := notifier.Subscribe(t.Context(), "test", 1)
 	if err != nil {
 		t.Fatalf("unexpected error while subscribing: %v", err)
 	}

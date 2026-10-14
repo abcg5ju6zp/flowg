@@ -30,6 +30,14 @@ func EstimateStorage(txn kv.QueryTx, stream string) (int64, error) {
 // from their running size estimate — so retention enforcement stays within the
 // backend's transaction size and time limits.
 func EvictOldestBatch(txn kv.MutationTx, stream string, toFree int64, limit int) (int64, int, error) {
+	// In-transaction fence on top of the per-run skip: a GC loop spans several
+	// transactions, so a purge that landed (or completed and rebuilt the name)
+	// between two batches must stop eviction before this batch touches another
+	// generation's keyspace.
+	if err := guardRetiring(txn, stream); err != nil {
+		return 0, 0, err
+	}
+
 	type victim struct {
 		key    kv.Key
 		record models.LogRecord

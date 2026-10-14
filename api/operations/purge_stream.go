@@ -15,6 +15,7 @@ import (
 	"link-society.com/flowg/api/routing"
 	"link-society.com/flowg/api/schemas"
 
+	"link-society.com/flowg/internal/engines/lognotify"
 	"link-society.com/flowg/internal/models"
 	storage "link-society.com/flowg/internal/storage/interfaces"
 )
@@ -27,12 +28,21 @@ type PurgeStreamDeps struct {
 
 	AuthStorage storage.AuthStorage
 	LogStorage  storage.LogStorage
+	LogNotifier lognotify.LogNotifier
 }
 
-// NewPurgeStreamUsecase removes a stream along with all of its logs and indexes.
+// NewPurgeStreamUsecase retires a stream generation and removes the generation
+// along with all of its logs, indexes, metadata and retention configuration.
 //
 // Callers must have the write-streams permission. This is a destructive
 // operation: the stored logs cannot be recovered afterwards.
+//
+// The retirement is a generation-fenced state machine: the stream is fenced
+// first (new writes and subscriptions are rejected), its live watchers receive
+// a definitive termination notice, in-flight writes are drained, and only then
+// are the entries, indexes, field metadata and configuration deleted to a
+// zero-key boundary. Purging a name that does not exist stays a successful
+// no-op.
 func NewPurgeStreamUsecase(deps PurgeStreamDeps) usecase.Interactor {
 	u := usecase.NewInteractor(
 		auth.RequireScopeApiDecorator(
@@ -44,12 +54,48 @@ func NewPurgeStreamUsecase(deps PurgeStreamDeps) usecase.Interactor {
 				req schemas.PurgeStreamRequest,
 				resp *schemas.PurgeStreamResponse,
 			) error {
-				err := deps.LogStorage.DeleteStream(ctx, req.Stream)
+				generation, existed, err := deps.LogStorage.FenceStream(ctx, req.Stream)
 				if err != nil {
+					deps.Logger.ErrorContext(
+						ctx,
+						"Failed to fence stream for purge",
+						slog.String("stream", req.Stream),
+						slog.String("error", err.Error()),
+					)
+
+					resp.Success = false
+					return status.Wrap(err, status.Internal)
+				}
+
+				if !existed {
+					// Unknown name: no fence was created, so generation-0
+					// watchers waiting for a future stream must not be closed.
+					resp.Success = true
+					return nil
+				}
+
+				// Close watchers at the fence boundary, before draining and
+				// deleting, so they cannot observe late records. Storage is the
+				// source of truth: a notifier failure is logged but must not
+				// leave the stream half-purged.
+				if err := deps.LogNotifier.CloseStream(
+					ctx, req.Stream, generation, lognotify.TerminationPurged,
+				); err != nil {
+					deps.Logger.ErrorContext(
+						ctx,
+						"Failed to terminate stream watchers",
+						slog.String("stream", req.Stream),
+						slog.Uint64("generation", generation),
+						slog.String("error", err.Error()),
+					)
+				}
+
+				if err := deps.LogStorage.FinishStreamRetirement(ctx, req.Stream); err != nil {
 					deps.Logger.ErrorContext(
 						ctx,
 						"Failed to purge stream",
 						slog.String("stream", req.Stream),
+						slog.Uint64("generation", generation),
 						slog.String("error", err.Error()),
 					)
 
@@ -61,6 +107,7 @@ func NewPurgeStreamUsecase(deps PurgeStreamDeps) usecase.Interactor {
 					ctx,
 					"Log stream purged",
 					slog.String("stream", req.Stream),
+					slog.Uint64("generation", generation),
 				)
 				resp.Success = true
 

@@ -59,7 +59,17 @@ func FetchStreamFields(txn kv.QueryTx, stream string) []string {
 // GetOrCreateStreamConfig returns a stream's configuration, lazily creating an
 // empty (default) config the first time a stream is referenced so later writes
 // have something to update. A non-nil override short-circuits to that config.
+//
+// A stream whose generation is being retired is fenced: the retirement guard
+// runs before the override short-circuit (so demo mode is fenced too) and
+// before the lazy creation (so a late write cannot resurrect a purged stream).
+// Creating a configuration assigns the next generation (1 for a new name,
+// counter+1 when a purged name is recreated).
 func GetOrCreateStreamConfig(txn kv.MutationTx, stream string, override *models.StreamConfig) (models.StreamConfig, error) {
+	if err := guardRetiring(txn, stream); err != nil {
+		return models.StreamConfig{}, err
+	}
+
 	if override != nil {
 		return *override, nil
 	}
@@ -76,6 +86,15 @@ func GetOrCreateStreamConfig(txn kv.MutationTx, stream string, override *models.
 	}
 
 	if val == nil {
+		// The name is (re)born: allocate its generation before creating the
+		// configuration, in the same transaction as the creation.
+		if err := createNextGeneration(txn, stream); err != nil {
+			return models.StreamConfig{}, fmt.Errorf(
+				"could not allocate generation for stream '%s': %w",
+				stream, err,
+			)
+		}
+
 		err := txn.Set(streamKey, []byte{})
 		if err != nil {
 			return models.StreamConfig{}, fmt.Errorf(
@@ -105,38 +124,47 @@ func GetOrCreateStreamConfig(txn kv.MutationTx, stream string, override *models.
 
 // SaveStreamConfig stores a new stream configuration and computes how its
 // indexed fields differ from the previous one. It returns the fields newly
-// added to the index (whose existing records must be back-filled) and the
-// fields removed from it (whose index must be dropped).
+// added to the index (whose existing records must be back-filled), the fields
+// removed from it (whose index must be dropped), and the generation under which
+// the configuration was written — callers bind their follow-up maintenance
+// batches to it so a concurrent purge cannot redirect them at another lineage.
 //
 // The actual back-fill and index removal are performed separately, in their own
 // batched transactions, because on a large stream they can exceed a single
 // transaction's size and time limits.
 //
 // When override is not nil, the previous configuration is taken to be override
-// (see [GetOrCreateStreamConfig]).
+// (see [GetOrCreateStreamConfig]); the returned generation is the current
+// counter value (0 when the name has never been persisted, as happens in demo
+// mode where no config is stored).
 func SaveStreamConfig(
 	txn kv.MutationTx,
 	stream string,
 	config models.StreamConfig,
 	override *models.StreamConfig,
-) (toIndex []string, toUnindex []string, err error) {
+) (toIndex []string, toUnindex []string, generation uint64, err error) {
 	if config.IndexedFields == nil {
 		config.IndexedFields = []string{}
 	}
 
 	oldConfig, err := GetOrCreateStreamConfig(txn, stream, override)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not fetch old stream config '%s': %w", stream, err)
+		return nil, nil, 0, fmt.Errorf("could not fetch old stream config '%s': %w", stream, err)
+	}
+
+	generation, err = readGeneration(txn, stream)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 
 	streamKey := kv.Key{"stream", "config", stream}
 	configVal, err := json.Marshal(config)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not marshal stream config '%s': %w", stream, err)
+		return nil, nil, 0, fmt.Errorf("could not marshal stream config '%s': %w", stream, err)
 	}
 
 	if err := txn.Set(streamKey, configVal); err != nil {
-		return nil, nil, fmt.Errorf("could not save stream config '%s': %w", stream, err)
+		return nil, nil, 0, fmt.Errorf("could not save stream config '%s': %w", stream, err)
 	}
 
 	for _, field := range config.IndexedFields {
@@ -151,54 +179,5 @@ func SaveStreamConfig(
 		}
 	}
 
-	return toIndex, toUnindex, nil
-}
-
-// DeleteStreamDataBatch deletes up to limit of a stream's data keys — its log
-// entries ("entry:<stream>:*"), inverted indexes ("index:<stream>:*") and field
-// markers ("stream:field:<stream>:*") — and reports how many it deleted. A count
-// of zero means all data is gone (the configuration key is removed separately by
-// [DeleteStreamConfig]). Callers loop until it returns zero so the work stays
-// within the backend's transaction limits.
-func DeleteStreamDataBatch(txn kv.MutationTx, stream string, limit int) (int, error) {
-	prefixes := []kv.Key{
-		{"entry", stream},
-		{"index", stream},
-		{"stream", "field", stream},
-	}
-
-	var keys []kv.Key
-	for _, prefix := range prefixes {
-		for key := range txn.IterKeys(prefix, kv.KeyRange{}) {
-			keys = append(keys, key)
-			if len(keys) >= limit {
-				break
-			}
-		}
-		if len(keys) >= limit {
-			break
-		}
-	}
-
-	for _, key := range keys {
-		if err := txn.Clear(key); err != nil {
-			return len(keys), fmt.Errorf(
-				"could not delete key '%s' from stream '%s': %w",
-				key, stream, err,
-			)
-		}
-	}
-
-	return len(keys), nil
-}
-
-// DeleteStreamConfig removes a stream's configuration key. It is cleared last,
-// after all the stream's data, so an interrupted deletion can be resumed.
-func DeleteStreamConfig(txn kv.MutationTx, stream string) error {
-	streamKey := kv.Key{"stream", "config", stream}
-	if err := txn.Clear(streamKey); err != nil {
-		return fmt.Errorf("could not delete stream config '%s': %w", stream, err)
-	}
-
-	return nil
+	return toIndex, toUnindex, generation, nil
 }

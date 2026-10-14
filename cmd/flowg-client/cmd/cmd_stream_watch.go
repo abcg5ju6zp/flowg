@@ -108,6 +108,25 @@ func NewStreamWatchCommand() *cobra.Command {
 					fmt.Fprintf(os.Stderr, "ERROR: %s\n", event.Data)
 					ExitCode = 1
 					return
+
+				case "stream-retired":
+					var termination struct {
+						Generation uint64 `json:"generation"`
+						Reason     string `json:"reason"`
+					}
+
+					if err := json.Unmarshal([]byte(event.Data), &termination); err != nil {
+						fmt.Fprintf(os.Stderr, "ERROR: Could not unmarshal stream retirement: %v\n", err)
+						ExitCode = 1
+						return
+					}
+
+					fmt.Fprintf(
+						os.Stderr,
+						"stream %q was retired (generation %d): %s\n",
+						opts.name, termination.Generation, termination.Reason,
+					)
+					return
 				}
 			}
 		},

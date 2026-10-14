@@ -80,6 +80,21 @@ func (m *MockLogStorage) DeleteStream(ctx context.Context, stream string) error 
 	return args.Error(0)
 }
 
+func (m *MockLogStorage) FenceStream(ctx context.Context, stream string) (uint64, bool, error) {
+	args := m.Called(ctx, stream)
+	return args.Get(0).(uint64), args.Bool(1), args.Error(2)
+}
+
+func (m *MockLogStorage) FinishStreamRetirement(ctx context.Context, stream string) error {
+	args := m.Called(ctx, stream)
+	return args.Error(0)
+}
+
+func (m *MockLogStorage) StreamState(ctx context.Context, stream string) (storage.StreamState, error) {
+	args := m.Called(ctx, stream)
+	return args.Get(0).(storage.StreamState), args.Error(1)
+}
+
 func (m *MockLogStorage) StreamUsage(ctx context.Context, stream string) (int64, error) {
 	args := m.Called(ctx, stream)
 	return args.Get(0).(int64), args.Error(1)
