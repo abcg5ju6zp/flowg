@@ -14,6 +14,15 @@ import (
 type ConfigStorage interface {
 	Streamable
 
+	// ReadConfigVersion returns the monotonically increasing version assigned
+	// to the last committed configuration mutation; 0 on a legacy store that
+	// has never performed a versioned mutation.
+	ReadConfigVersion(ctx context.Context) (uint64, error)
+	// ListItemVersions maps the name of every stamped item of the given kind
+	// ("transformer", "pipeline" or "forwarder") to the version at which it
+	// last changed. Items without a version stamp (legacy data) are absent.
+	ListItemVersions(ctx context.Context, itemType string) (map[string]uint64, error)
+
 	// ListTransformers returns the names of every stored transformer.
 	ListTransformers(ctx context.Context) ([]string, error)
 	// ReadTransformer returns the VRL source of the named transformer, or nil if

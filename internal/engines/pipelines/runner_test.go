@@ -48,6 +48,35 @@ func testRunnerModules(configOpts badgerconfig.Options, logOpts badgerlog.Option
 	}
 }
 
+const brokenRawTestPipeline = `{"version":2,"nodes":[`
+
+func waitForStatus(
+	t *testing.T,
+	runner Runner,
+	pipelineName string,
+	match func(PipelineStatus) bool,
+) PipelineStatus {
+	t.Helper()
+
+	var last PipelineStatus
+
+	waitFor(t, 5*time.Second, func() bool {
+		statuses, err := runner.Status(t.Context())
+		if err != nil {
+			return false
+		}
+		for _, status := range statuses {
+			if status.Name == pipelineName {
+				last = status
+				return match(status)
+			}
+		}
+		return false
+	})
+
+	return last
+}
+
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 
@@ -151,5 +180,140 @@ func TestRunner_StartsPersistedPipelinesOnBoot(t *testing.T) {
 	record := models.NewLogRecord(map[string]string{"message": "test"})
 	if err := runner.Process(t.Context(), "test", DIRECT_ENTRYPOINT, record); err != nil {
 		t.Fatalf("expected pipeline to be running after boot, got: %v", err)
+	}
+}
+
+func TestRunner_BootWithBrokenPipelineReportsError(t *testing.T) {
+	dir := t.TempDir()
+
+	configOpts := badgerconfig.DefaultOptions()
+	configOpts.Directory = dir
+	logOpts := badgerlog.DefaultOptions()
+	logOpts.InMemory = true
+
+	// seed a good and a broken pipeline with a first app instance
+	{
+		var configStorage storage.ConfigStorage
+
+		app := fxtest.New(
+			t,
+			fx.Supply(slog.New(slog.DiscardHandler)),
+			fx.Options(testRunnerModules(configOpts, logOpts)...),
+			fx.Populate(&configStorage),
+		)
+		app.RequireStart()
+
+		if err := configStorage.WriteRawPipeline(t.Context(), "good", rawTestPipeline); err != nil {
+			t.Fatalf("failed to write good pipeline: %v", err)
+		}
+		if err := configStorage.WriteRawPipeline(t.Context(), "broken", brokenRawTestPipeline); err != nil {
+			t.Fatalf("failed to write broken pipeline: %v", err)
+		}
+
+		app.RequireStop()
+	}
+
+	// a fresh instance serves the good build immediately and exposes the
+	// broken one as an error without blocking startup
+	var runner Runner
+
+	app := fxtest.New(
+		t,
+		fx.Supply(slog.New(slog.DiscardHandler)),
+		fx.Options(testRunnerModules(configOpts, logOpts)...),
+		fx.Populate(&runner),
+	)
+	app.RequireStart()
+	defer app.RequireStop()
+
+	record := models.NewLogRecord(map[string]string{"message": "test"})
+	if err := runner.Process(t.Context(), "good", DIRECT_ENTRYPOINT, record); err != nil {
+		t.Fatalf("expected good pipeline to serve after boot, got: %v", err)
+	}
+
+	broken := waitForStatus(t, runner, "broken", func(status PipelineStatus) bool {
+		return status.Phase == PhaseError
+	})
+	if broken.Serving {
+		t.Fatalf("expected broken pipeline to have no serving build, got: %+v", broken)
+	}
+	if broken.Error == "" {
+		t.Fatal("expected the build failure reason to be exposed")
+	}
+
+	good := waitForStatus(t, runner, "good", func(status PipelineStatus) bool {
+		return status.Phase == PhaseRunning && status.Serving
+	})
+	if good.ActiveVersion == 0 {
+		t.Fatalf("expected good pipeline to be stamped with its config version, got: %+v", good)
+	}
+}
+
+func TestRunner_FailedSaveKeepsServingThenRecovers(t *testing.T) {
+	configOpts := badgerconfig.DefaultOptions()
+	configOpts.InMemory = true
+	logOpts := badgerlog.DefaultOptions()
+	logOpts.InMemory = true
+
+	var (
+		runner        Runner
+		configStorage storage.ConfigStorage
+	)
+
+	app := fxtest.New(
+		t,
+		fx.Supply(slog.New(slog.DiscardHandler)),
+		fx.Options(testRunnerModules(configOpts, logOpts)...),
+		fx.Populate(&runner, &configStorage),
+	)
+	app.RequireStart()
+	defer app.RequireStop()
+
+	ctx := t.Context()
+	record := models.NewLogRecord(map[string]string{"message": "test"})
+
+	if err := configStorage.WriteRawPipeline(ctx, "flaky", rawTestPipeline); err != nil {
+		t.Fatalf("failed to write pipeline: %v", err)
+	}
+	healthy := waitForStatus(t, runner, "flaky", func(status PipelineStatus) bool {
+		return status.Phase == PhaseRunning
+	})
+
+	if err := runner.Process(ctx, "flaky", DIRECT_ENTRYPOINT, record); err != nil {
+		t.Fatalf("expected healthy pipeline to serve: %v", err)
+	}
+
+	// a broken save fails to build: the old build must keep serving, exposed
+	// as an error against the newer desired version
+	if err := configStorage.WriteRawPipeline(ctx, "flaky", brokenRawTestPipeline); err != nil {
+		t.Fatalf("failed to write broken pipeline: %v", err)
+	}
+	failed := waitForStatus(t, runner, "flaky", func(status PipelineStatus) bool {
+		return status.Phase == PhaseError &&
+			status.Serving &&
+			status.DesiredVersion > status.ActiveVersion
+	})
+	if failed.ActiveVersion != healthy.ActiveVersion {
+		t.Fatalf("expected fallback to stay on version %d, got %d",
+			healthy.ActiveVersion, failed.ActiveVersion)
+	}
+	if err := runner.Process(ctx, "flaky", DIRECT_ENTRYPOINT, record); err != nil {
+		t.Fatalf("expected last runnable build to keep serving after failure: %v", err)
+	}
+
+	// a fixed save converges the instance back to running
+	if err := configStorage.WriteRawPipeline(ctx, "flaky", rawTestPipeline); err != nil {
+		t.Fatalf("failed to rewrite healthy pipeline: %v", err)
+	}
+	recovered := waitForStatus(t, runner, "flaky", func(status PipelineStatus) bool {
+		return status.Phase == PhaseRunning &&
+			status.ActiveVersion == status.DesiredVersion &&
+			status.ActiveVersion > failed.DesiredVersion
+	})
+	if !recovered.Serving || recovered.Error != "" {
+		t.Fatalf("expected recovered status, got: %+v", recovered)
+	}
+	if err := runner.Process(ctx, "flaky", DIRECT_ENTRYPOINT, record); err != nil {
+		t.Fatalf("expected recovered pipeline to serve: %v", err)
 	}
 }

@@ -21,19 +21,56 @@ import (
 	"link-society.com/flowg/internal/engines/lognotify"
 )
 
-// Runner executes pipelines against incoming log records. It is the public entry
-// point of the engine: callers submit a record to a named pipeline and the
-// runner drives it through the pipeline's node graph.
+// bootstrapBuilds eagerly compiles every persisted pipeline concurrently,
+// tagging each result with the pipeline's per-item configuration version.
+// Build errors are returned per pipeline, never failing the whole startup.
+func bootstrapBuilds(
+	ctx context.Context,
+	configStorage storage.ConfigStorage,
+	pipelines []string,
+	versions map[string]uint64,
+) []bootBuildResult {
+	results := make([]bootBuildResult, len(pipelines))
+
+	var wg sync.WaitGroup
+	for i, pipelineName := range pipelines {
+		wg.Add(1)
+
+		go func(i int, name string) {
+			defer wg.Done()
+
+			pipeline, err := buildCandidate(ctx, configStorage, name)
+
+			results[i] = bootBuildResult{
+				name:     name,
+				version:  versions[name],
+				pipeline: pipeline,
+				err:      err,
+			}
+		}(i, pipelineName)
+	}
+	wg.Wait()
+
+	return results
+}
+
+// Runner executes pipelines against incoming log records. It is the public
+// entry point of the engine: callers submit a record to a named pipeline and
+// the runner drives it through the pipeline's node graph.
 //
-// The pipeline lifecycle itself is not part of the interface: builds are
-// started eagerly at boot and follow configuration changes broadcast on the
-// confignotify bus.
+// The pipeline lifecycle itself is not part of the interface: the stored
+// configuration's current version is reconciled eagerly at boot and follows
+// every versioned change broadcast on the confignotify bus.
 type Runner interface {
 	// Process pushes a record through pipelineName, starting at entrypoint (e.g.
 	// "direct" or "syslog"), and blocks until processing completes.
 	Process(ctx context.Context, pipelineName string, entrypoint string, record *models.LogRecord) error
 	// ScrapMetrics forwards a request to scrap metrics from a pipeline.
 	ScrapMetrics(ctx context.Context, pipelineName string, w io.Writer) error
+	// Status returns the convergence state of every pipeline: the version
+	// currently serving, the desired version and the running/pending/error
+	// phase, including build failures kept alive by an older build.
+	Status(ctx context.Context) ([]PipelineStatus, error)
 }
 
 type runnerImpl struct {
@@ -53,8 +90,9 @@ type deps struct {
 var _ Runner = (*runnerImpl)(nil)
 
 // NewRunner returns an fx module providing a Runner backed by a single actor.
-// The actor owns the pipeline build cache; on shutdown every cached build is
-// invalidated (closing forwarders and transformers) before the actor stops.
+// The actor owns the pipeline convergence state and build cache; on shutdown
+// every active build is invalidated (closing forwarders and transformers)
+// before the actor stops.
 func NewRunner() fx.Option {
 	return fx.Module(
 		"pipelineRunner",
@@ -75,52 +113,81 @@ func NewRunner() fx.Option {
 			return mbox
 		}),
 		fx.Provide(func(lc fx.Lifecycle, d deps, mbox actor.Mailbox[message]) Runner {
+			buildCtx, stopBuilds := context.WithCancel(context.Background())
+
 			w := &worker{
 				logger:        d.Logger.With(slog.String("channel", "pipelines")),
 				mbox:          mbox,
 				configStorage: d.ConfigStorage,
 				logStorage:    d.LogStorage,
 				logNotifier:   d.LogNotifier,
+				buildCtx:      buildCtx,
 
-				cache:   make(map[string]*Pipeline),
-				cacheMu: sync.Mutex{},
+				cache:  make(map[string]*Pipeline),
+				states: make(map[string]*pipelineState),
 			}
 			a := actor.New(w)
 			runner := &runnerImpl{mbox: mbox}
 
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
-					// the subscription must outlive the start phase; it is torn down
-					// with the notifier's own lifecycle
+					// the subscription must outlive the start phase; it is torn
+					// down with the notifier's own lifecycle. It is armed before
+					// the actor starts, so no change event can be missed: events
+					// emitted during the boot builds queue in the subscription
+					// mailbox and are processed after the bootstrap seed.
 					events, err := d.ConfigNotifier.Subscribe(context.Background())
 					if err != nil {
 						return fmt.Errorf("failed to subscribe to config changes: %w", err)
 					}
 					w.eventsC = events.ReceiveC()
 
-					a.Start()
+					// boot reconciliation: snapshot the configuration version
+					// and every persisted pipeline synchronously (a read
+					// failure keeps failing startup, as before), then eagerly
+					// build every pipeline concurrently so the service starts
+					// ready to serve. A broken pipeline is reported as error
+					// without preventing the others or the server from
+					// starting. The actor owns the final state transition.
+					globalVersion, err := d.ConfigStorage.ReadConfigVersion(ctx)
+					if err != nil {
+						return fmt.Errorf("failed to read config version at startup: %w", err)
+					}
 
 					pipelines, err := d.ConfigStorage.ListPipelines(ctx)
 					if err != nil {
 						return fmt.Errorf("failed to start pipelines: %w", err)
 					}
 
-					// a broken pipeline must not prevent the server (and the UI needed
-					// to fix it) from starting
-					for _, pipelineName := range pipelines {
-						if err := runner.run(ctx, pipelineName); err != nil {
-							w.logger.ErrorContext(
-								ctx,
-								"failed to start pipeline",
-								"pipeline", pipelineName,
-								"error", err.Error(),
-							)
-						}
+					versions, err := d.ConfigStorage.ListItemVersions(ctx, "pipeline")
+					if err != nil {
+						return fmt.Errorf("failed to read pipeline versions at startup: %w", err)
 					}
+
+					results := bootstrapBuilds(ctx, d.ConfigStorage, pipelines, versions)
+
+					// enqueue the bootstrap seed before starting the actor so it
+					// is the first message it processes; its boot gate keeps
+					// buffered config events behind it
+					if err := mbox.Send(ctx, bootstrapMessage{
+						version: globalVersion,
+						results: results,
+					}); err != nil {
+						for _, result := range results {
+							if result.pipeline != nil {
+								_ = result.pipeline.Close(context.Background())
+							}
+						}
+						return fmt.Errorf("failed to seed boot builds: %w", err)
+					}
+
+					a.Start()
 
 					return nil
 				},
 				OnStop: func(ctx context.Context) error {
+					stopBuilds()
+
 					w.cacheMu.Lock()
 					names := make([]string, 0, len(w.cache))
 					for pipelineName := range w.cache {
@@ -147,27 +214,6 @@ func NewRunner() fx.Option {
 			return runner
 		}),
 	)
-}
-
-// run sends a request to the actor to build and start a pipeline. Lifecycle is
-// internal: it is driven by the fx hooks and the confignotify events.
-func (r *runnerImpl) run(ctx context.Context, pipelineName string) error {
-	replyTo := make(chan error, 1)
-
-	err := r.mbox.Send(ctx, runMessage{
-		replyTo:      replyTo,
-		pipelineName: pipelineName,
-	})
-	if err != nil {
-		return err
-	}
-
-	select {
-	case err := <-replyTo:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // terminate sends a request to the actor to terminate a pipeline. It waits for
@@ -245,5 +291,23 @@ func (r *runnerImpl) ScrapMetrics(
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// Status sends a request to the actor for the current convergence state of
+// every pipeline.
+func (r *runnerImpl) Status(ctx context.Context) ([]PipelineStatus, error) {
+	replyTo := make(chan []PipelineStatus, 1)
+
+	err := r.mbox.Send(ctx, statusMessage{replyTo: replyTo})
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case statuses := <-replyTo:
+		return statuses, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }

@@ -162,3 +162,27 @@ HTTP 200
 [Asserts]
 jsonpath "$.success" == true
 jsonpath "$.pipelines" not contains "test"
+
+# -----------------------------------------------------------------------------
+# TEST:
+#  - Query the convergence status of pipeline instances
+#  - Authentication is required and the default pipeline reports a running,
+#    serving build stamped with its configuration version
+
+GET http://localhost:5080/api/v1/status/pipelines
+HTTP 401
+
+GET http://localhost:5080/api/v1/status/pipelines
+Authorization: Bearer {{admin_token}}
+[Options]
+retry: 30
+retry-interval: 100ms
+HTTP 200
+[Asserts]
+jsonpath "$.success" == true
+jsonpath "$.statuses" count == 1
+jsonpath "$.statuses[0].pipeline" == "default"
+jsonpath "$.statuses[0].phase" == "running"
+jsonpath "$.statuses[0].serving" == true
+jsonpath "$.statuses[0].active_version" exists
+jsonpath "$.statuses[0].desired_version" exists

@@ -76,9 +76,38 @@ func (s *Storage[QTx, MTx]) notify(ctx context.Context, event confignotify.Event
 		s.logger.ErrorContext(
 			ctx,
 			"failed to notify config change",
+			"kind", event.Kind,
+			"pipeline", event.Pipeline,
+			"version", event.Version,
 			"error", err.Error(),
 		)
 	}
+}
+
+// ReadConfigVersion implements [storage.ConfigStorage].
+func (s *Storage[QTx, MTx]) ReadConfigVersion(ctx context.Context) (uint64, error) {
+	var version uint64
+
+	err := s.adapter.View(ctx, func(txn QTx) error {
+		var err error
+		version, err = transactions.ReadVersion(txn)
+		return err
+	})
+
+	return version, err
+}
+
+// ListItemVersions implements [storage.ConfigStorage].
+func (s *Storage[QTx, MTx]) ListItemVersions(ctx context.Context, itemType string) (map[string]uint64, error) {
+	var versions map[string]uint64
+
+	err := s.adapter.View(ctx, func(txn QTx) error {
+		var err error
+		versions, err = transactions.ListItemVersions(txn, itemType)
+		return err
+	})
+
+	return versions, err
 }
 
 // Dump implements [storage.ConfigStorage].
@@ -87,14 +116,76 @@ func (s *Storage[QTx, MTx]) Dump(ctx context.Context, w io.Writer, version uint6
 }
 
 // Load implements [storage.ConfigStorage].
+//
+// After the snapshot is loaded, a single version transaction advances the
+// global version and stamps every surviving pipeline, transformer and
+// forwarder with it, so the restored content is always reconciled even when
+// the snapshot carried smaller per-item versions than the running builds.
 func (s *Storage[QTx, MTx]) Load(ctx context.Context, r io.Reader) error {
 	if err := s.adapter.Restore(ctx, r); err != nil {
 		return err
 	}
 
+	version, err := s.stampRestoredVersions(ctx)
+	if err != nil {
+		return err
+	}
+
 	s.InvalidateSystemConfigCache()
-	s.notify(ctx, confignotify.Event{Kind: confignotify.DependenciesChanged})
+	s.notify(ctx, confignotify.Event{
+		Kind:    confignotify.DependenciesChanged,
+		Version: version,
+	})
 	return nil
+}
+
+// stampRestoredVersions runs the post-restore version transaction: bump the
+// global version once, stamp every surviving item with it and drop stamps
+// orphaned by the restore, returning the new global version.
+func (s *Storage[QTx, MTx]) stampRestoredVersions(ctx context.Context) (uint64, error) {
+	var version uint64
+
+	err := s.adapter.Update(ctx, func(txn MTx) error {
+		var err error
+		version, err = transactions.BumpGlobalVersion(txn)
+		if err != nil {
+			return err
+		}
+
+		for _, itemType := range []string{transformerItemType, pipelineItemType, forwarderItemType} {
+			names, err := transactions.ListItems(txn, itemType)
+			if err != nil {
+				return err
+			}
+
+			versions, err := transactions.ListItemVersions(txn, itemType)
+			if err != nil {
+				return err
+			}
+
+			listed := make(map[string]struct{}, len(names))
+			for _, name := range names {
+				listed[name] = struct{}{}
+
+				if err := transactions.StampItemVersion(txn, itemType, name, version); err != nil {
+					return err
+				}
+			}
+
+			for name := range versions {
+				if _, exists := listed[name]; exists {
+					continue
+				}
+				if err := transactions.ClearItemVersion(txn, itemType, name); err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	})
+
+	return version, err
 }
 
 // InvalidateSystemConfigCache drops the in-memory system configuration so the
@@ -127,21 +218,29 @@ func (s *Storage[QTx, MTx]) ReadTransformer(ctx context.Context, name string) (*
 
 // WriteTransformer implements [storage.ConfigStorage].
 func (s *Storage[QTx, MTx]) WriteTransformer(ctx context.Context, name string, content string) error {
-	if err := s.writeItem(ctx, transformerItemType, name, []byte(content)); err != nil {
+	version, err := s.writeItem(ctx, transformerItemType, name, []byte(content))
+	if err != nil {
 		return err
 	}
 
-	s.notify(ctx, confignotify.Event{Kind: confignotify.DependenciesChanged})
+	s.notify(ctx, confignotify.Event{
+		Kind:    confignotify.DependenciesChanged,
+		Version: version,
+	})
 	return nil
 }
 
 // DeleteTransformer implements [storage.ConfigStorage].
 func (s *Storage[QTx, MTx]) DeleteTransformer(ctx context.Context, name string) error {
-	if err := s.deleteItem(ctx, transformerItemType, name); err != nil {
+	version, err := s.deleteItem(ctx, transformerItemType, name)
+	if err != nil {
 		return err
 	}
 
-	s.notify(ctx, confignotify.Event{Kind: confignotify.DependenciesChanged})
+	s.notify(ctx, confignotify.Event{
+		Kind:    confignotify.DependenciesChanged,
+		Version: version,
+	})
 	return nil
 }
 
@@ -182,31 +281,46 @@ func (s *Storage[QTx, MTx]) WritePipeline(ctx context.Context, name string, flow
 		return fmt.Errorf("failed to marshal flow graph: %w", err)
 	}
 
-	if err := s.writeItem(ctx, pipelineItemType, name, content); err != nil {
+	version, err := s.writeItem(ctx, pipelineItemType, name, content)
+	if err != nil {
 		return err
 	}
 
-	s.notify(ctx, confignotify.Event{Kind: confignotify.PipelineChanged, Pipeline: name})
+	s.notify(ctx, confignotify.Event{
+		Kind:     confignotify.PipelineChanged,
+		Pipeline: name,
+		Version:  version,
+	})
 	return nil
 }
 
 // WriteRawPipeline implements [storage.ConfigStorage].
 func (s *Storage[QTx, MTx]) WriteRawPipeline(ctx context.Context, name string, content string) error {
-	if err := s.writeItem(ctx, pipelineItemType, name, []byte(content)); err != nil {
+	version, err := s.writeItem(ctx, pipelineItemType, name, []byte(content))
+	if err != nil {
 		return err
 	}
 
-	s.notify(ctx, confignotify.Event{Kind: confignotify.PipelineChanged, Pipeline: name})
+	s.notify(ctx, confignotify.Event{
+		Kind:     confignotify.PipelineChanged,
+		Pipeline: name,
+		Version:  version,
+	})
 	return nil
 }
 
 // DeletePipeline implements [storage.ConfigStorage].
 func (s *Storage[QTx, MTx]) DeletePipeline(ctx context.Context, name string) error {
-	if err := s.deleteItem(ctx, pipelineItemType, name); err != nil {
+	version, err := s.deleteItem(ctx, pipelineItemType, name)
+	if err != nil {
 		return err
 	}
 
-	s.notify(ctx, confignotify.Event{Kind: confignotify.PipelineDeleted, Pipeline: name})
+	s.notify(ctx, confignotify.Event{
+		Kind:     confignotify.PipelineDeleted,
+		Pipeline: name,
+		Version:  version,
+	})
 	return nil
 }
 
@@ -248,21 +362,29 @@ func (s *Storage[QTx, MTx]) WriteForwarder(ctx context.Context, name string, for
 		return fmt.Errorf("failed to marshal forwarder: %w", err)
 	}
 
-	if err := s.writeItem(ctx, forwarderItemType, name, content); err != nil {
+	version, err := s.writeItem(ctx, forwarderItemType, name, content)
+	if err != nil {
 		return err
 	}
 
-	s.notify(ctx, confignotify.Event{Kind: confignotify.DependenciesChanged})
+	s.notify(ctx, confignotify.Event{
+		Kind:    confignotify.DependenciesChanged,
+		Version: version,
+	})
 	return nil
 }
 
 // DeleteForwarder implements [storage.ConfigStorage].
 func (s *Storage[QTx, MTx]) DeleteForwarder(ctx context.Context, name string) error {
-	if err := s.deleteItem(ctx, forwarderItemType, name); err != nil {
+	version, err := s.deleteItem(ctx, forwarderItemType, name)
+	if err != nil {
 		return err
 	}
 
-	s.notify(ctx, confignotify.Event{Kind: confignotify.DependenciesChanged})
+	s.notify(ctx, confignotify.Event{
+		Kind:    confignotify.DependenciesChanged,
+		Version: version,
+	})
 	return nil
 }
 
@@ -331,7 +453,12 @@ func (s *Storage[QTx, MTx]) WriteSystemConfig(ctx context.Context, config *model
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	return s.writeItem(ctx, systemItemType, "config", content)
+	// the system configuration is not part of the pipeline configuration
+	// version stream (it does not affect compiled graphs), so it is stored
+	// without bumping the global config version
+	return s.adapter.Update(ctx, func(txn MTx) error {
+		return transactions.WriteItem(txn, systemItemType, "config", content)
+	})
 }
 
 func (s *Storage[QTx, MTx]) listItems(ctx context.Context, itemType string) ([]string, error) {
@@ -358,14 +485,42 @@ func (s *Storage[QTx, MTx]) readItem(ctx context.Context, itemType string, name 
 	return content, err
 }
 
-func (s *Storage[QTx, MTx]) writeItem(ctx context.Context, itemType string, name string, content []byte) error {
-	return s.adapter.Update(ctx, func(txn MTx) error {
-		return transactions.WriteItem(txn, itemType, name, content)
+// writeItem stores the item and advances the configuration version in the same
+// transaction, returning the new global version.
+func (s *Storage[QTx, MTx]) writeItem(ctx context.Context, itemType string, name string, content []byte) (uint64, error) {
+	var version uint64
+
+	err := s.adapter.Update(ctx, func(txn MTx) error {
+		if err := transactions.WriteItem(txn, itemType, name, content); err != nil {
+			return err
+		}
+
+		var err error
+		version, err = transactions.BumpVersion(txn, itemType, name)
+		return err
 	})
+
+	return version, err
 }
 
-func (s *Storage[QTx, MTx]) deleteItem(ctx context.Context, itemType string, name string) error {
-	return s.adapter.Update(ctx, func(txn MTx) error {
-		return transactions.DeleteItem(txn, itemType, name)
+// deleteItem removes the item and its version stamp while advancing the global
+// version in the same transaction, returning the new global version.
+func (s *Storage[QTx, MTx]) deleteItem(ctx context.Context, itemType string, name string) (uint64, error) {
+	var version uint64
+
+	err := s.adapter.Update(ctx, func(txn MTx) error {
+		if err := transactions.DeleteItem(txn, itemType, name); err != nil {
+			return err
+		}
+
+		var err error
+		version, err = transactions.BumpGlobalVersion(txn)
+		if err != nil {
+			return err
+		}
+
+		return transactions.ClearItemVersion(txn, itemType, name)
 	})
+
+	return version, err
 }

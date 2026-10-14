@@ -20,9 +20,16 @@ const (
 // Event is a single configuration change notification. Pipeline carries the
 // affected pipeline name for the pipeline-scoped kinds and is empty for
 // DependenciesChanged.
+//
+// Version is the global configuration version committed with the change:
+// storage commit, notification, dependency resolution, candidate build and
+// instance switch are all correlated through it. Consumers skip events whose
+// version they already acknowledged. A zero Version means "unknown" (legacy
+// producers) and must be processed unconditionally.
 type Event struct {
 	Kind     EventKind
 	Pipeline string
+	Version  uint64
 }
 
 // SubscribeMessage requests a new subscription on the actor. SenderM is the

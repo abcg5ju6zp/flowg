@@ -26,6 +26,31 @@ top of any [generic/kv](../../generic/kv) adapter.
   behind it: on restore, or when another node of a cluster wrote it.
 - **Snapshots** — satisfies `Streamable` so the configuration database can be
   backed up and restored.
+- **Configuration versions** — every pipeline, transformer and forwarder
+  mutation is stamped with a strictly increasing, queryable configuration
+  version, so the pipeline runner can correlate commits, notifications and
+  builds and deduplicate them.
+
+## Configuration versioning
+
+Every successful write or delete of a pipeline, transformer or forwarder
+commits three things in a single key-value transaction:
+
+- the data key `<itemType>/<name>` (unchanged layout);
+- the global version at `meta/config-version`, incremented by one;
+- the per-item version at `meta/item-version/<itemType>/<name>`, stamped with
+  the new global value (and cleared on delete).
+
+The notifier event emitted after the commit carries the new global version.
+`ReadConfigVersion` and `ListItemVersions` expose the versions; stores without
+the meta keys (legacy databases) read as version `0`, which consumers treat as
+"unknown" rather than skipping. The system configuration is not part of the
+version stream because it does not affect compiled pipelines.
+
+Restore (`Load`) bumps the global version once in a follow-up transaction and
+stamps every surviving item with that value, so a restore — including content
+that carried smaller versions in the snapshot — is always reconciled, and the
+subsequent `DependenciesChanged` event carries the new version.
 
 ## Layout
 

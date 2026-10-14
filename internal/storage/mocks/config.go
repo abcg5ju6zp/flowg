@@ -32,6 +32,19 @@ func (m *MockConfigStorage) Load(ctx context.Context, r io.Reader) error {
 	return args.Error(0)
 }
 
+func (m *MockConfigStorage) ReadConfigVersion(ctx context.Context) (uint64, error) {
+	args := m.Called(ctx)
+	return args.Get(0).(uint64), args.Error(1)
+}
+
+func (m *MockConfigStorage) ListItemVersions(ctx context.Context, itemType string) (map[string]uint64, error) {
+	args := m.Called(ctx, itemType)
+	if v := args.Get(0); v != nil {
+		return v.(map[string]uint64), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
 func (m *MockConfigStorage) ListTransformers(ctx context.Context) ([]string, error) {
 	args := m.Called(ctx)
 	return args.Get(0).([]string), args.Error(1)

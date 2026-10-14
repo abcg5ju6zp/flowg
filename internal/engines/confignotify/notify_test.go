@@ -32,6 +32,7 @@ func TestNotifier(t *testing.T) {
 	event := confignotify.Event{
 		Kind:     confignotify.PipelineChanged,
 		Pipeline: "test",
+		Version:  42,
 	}
 
 	if err := notifier.Notify(t.Context(), event); err != nil {

@@ -32,3 +32,11 @@ func (m *MockRunner) ScrapMetrics(ctx context.Context, pipelineName string, w io
 	args := m.Called(ctx, pipelineName, w)
 	return args.Error(0)
 }
+
+func (m *MockRunner) Status(ctx context.Context) ([]pipelines.PipelineStatus, error) {
+	args := m.Called(ctx)
+	if v := args.Get(0); v != nil {
+		return v.([]pipelines.PipelineStatus), args.Error(1)
+	}
+	return nil, args.Error(1)
+}

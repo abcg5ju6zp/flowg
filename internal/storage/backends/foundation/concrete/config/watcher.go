@@ -14,19 +14,27 @@ import (
 	"link-society.com/flowg/internal/engines/confignotify"
 
 	"link-society.com/flowg/internal/storage/backends/foundation"
+	"link-society.com/flowg/internal/storage/databases/config/transactions"
 	"link-society.com/flowg/internal/storage/generic/kv"
 )
 
-// watchedItemTypes are the config item prefixes the watcher observes:
-// pipeline, transformer and forwarder changes drive the pipeline lifecycle,
-// system changes invalidate the cached system configuration.
-var watchedItemTypes = []string{"pipeline", "transformer", "forwarder", "system"}
+// watchedItemTypes are the config item prefixes carrying per-item versions the
+// watcher diffs to emit lifecycle events; the system item is observed
+// separately because it only drives the local system-config cache.
+var watchedItemTypes = []string{"pipeline", "transformer", "forwarder"}
 
 // watchBackoff is how long the watcher waits before re-arming after an error.
 const watchBackoff = 5 * time.Second
 
-// snapshot maps item type to item name to a hash of its serialized value.
-type snapshot map[string]map[string][sha256.Size]byte
+// snapshot is the versioned configuration view at one point in time: the
+// global configuration version, per-item version maps and a hash map of the
+// system configuration. Items without a version stamp (legacy data) are
+// absent from the maps and read as version 0.
+type snapshot struct {
+	globalVersion uint64
+	versions      map[string]map[string]uint64
+	system        map[string][sha256.Size]byte
+}
 
 // systemConfigCache is the subset of the config storage the watcher needs to
 // drop the cached system configuration on remote changes.
@@ -35,25 +43,25 @@ type systemConfigCache interface {
 }
 
 // watchWorker observes the config changelog key and translates mutations into
-// confignotify events, so every node of the cluster (including the one that
-// made the change) reacts to configuration changes through the same path.
+// versioned confignotify events, so every node of the cluster (including the
+// one that made the change) reacts to configuration changes through the same
+// path.
 type watchWorker struct {
 	logger      *slog.Logger
 	adapter     *foundation.FoundationAdapter
 	notifier    confignotify.Notifier
 	systemCache systemConfigCache
 
-	current snapshot
+	current *snapshot
 }
 
 var _ actor.Worker = (*watchWorker)(nil)
 
-// DoWork arms the changelog watch, diffs the config items against the previous
-// snapshot, emits the matching events and waits for the watch to fire. Arming
-// the watch before scanning guarantees no change is missed in between, and
-// watch coalescing is harmless because the diff always compares against the
-// stored state. The first scan primes the snapshot silently: the pipeline
-// runner builds everything at boot on its own.
+// DoWork arms the changelog watch, scans the versioned configuration view and
+// waits for the watch to fire. Arming the watch before scanning guarantees no
+// change is missed in between, and watch coalescing is harmless because the
+// diff always compares against stored versions. The first scan primes the
+// snapshot silently: the pipeline runner builds everything at boot on its own.
 func (w *watchWorker) DoWork(ctx actor.Context) actor.WorkerStatus {
 	if ctx.Err() != nil {
 		return actor.WorkerEnd
@@ -94,20 +102,32 @@ func (w *watchWorker) DoWork(ctx actor.Context) actor.WorkerStatus {
 	}
 }
 
-// scan hashes every watched config item in a single read transaction.
-func (w *watchWorker) scan(ctx context.Context) (snapshot, error) {
-	next := make(snapshot, len(watchedItemTypes))
+// scan reads the global configuration version, the per-item version maps and
+// the hashed system configuration in a single read transaction.
+func (w *watchWorker) scan(ctx context.Context) (*snapshot, error) {
+	next := &snapshot{
+		versions: make(map[string]map[string]uint64, len(watchedItemTypes)),
+		system:   make(map[string][sha256.Size]byte),
+	}
 
 	err := w.adapter.View(ctx, func(txn *foundation.FoundationQueryTx) error {
+		var err error
+		next.globalVersion, err = transactions.ReadVersion(txn)
+		if err != nil {
+			return err
+		}
+
 		for _, itemType := range watchedItemTypes {
-			items := make(map[string][sha256.Size]byte)
-
-			for pair := range txn.IterPairs(kv.Key{itemType}, kv.KeyRange{}) {
-				key := pair.Key()
-				items[key[len(key)-1]] = sha256.Sum256(pair.Value())
+			versions, err := transactions.ListItemVersions(txn, itemType)
+			if err != nil {
+				return err
 			}
+			next.versions[itemType] = versions
+		}
 
-			next[itemType] = items
+		for pair := range txn.IterPairs(kv.Key{"system"}, kv.KeyRange{}) {
+			key := pair.Key()
+			next.system[key[len(key)-1]] = sha256.Sum256(pair.Value())
 		}
 
 		return nil
@@ -119,36 +139,50 @@ func (w *watchWorker) scan(ctx context.Context) (snapshot, error) {
 	return next, nil
 }
 
-// emitDiff broadcasts the difference between two snapshots. A system config
-// change drops the local cache; a transformer or forwarder change collapses
-// into a single DependenciesChanged event, since the resulting reconcile
-// rebuilds every pipeline anyway.
-func (w *watchWorker) emitDiff(ctx context.Context, previous snapshot, next snapshot) {
-	if !maps.Equal(previous["system"], next["system"]) {
+// emitDiff broadcasts the versioned difference between two snapshots. A system
+// config change drops the local cache; a transformer or forwarder version
+// change collapses into a single DependenciesChanged stamped with the global
+// version, since the resulting reconcile rebuilds every pipeline anyway;
+// pipeline versions changed since the previous snapshot produce per-pipeline
+// create/update or delete events. Items whose version did not change emit
+// nothing, so a reconnected watch only reports versions the runner has not yet
+// acknowledged.
+func (w *watchWorker) emitDiff(ctx context.Context, previous *snapshot, next *snapshot) {
+	if !maps.Equal(previous.system, next.system) {
 		w.systemCache.InvalidateSystemConfigCache()
 	}
 
-	for _, itemType := range []string{"transformer", "forwarder"} {
-		if !maps.Equal(previous[itemType], next[itemType]) {
-			w.notify(ctx, confignotify.Event{Kind: confignotify.DependenciesChanged})
+	for _, itemType := range watchedItemTypes {
+		if itemType == "pipeline" {
+			continue
+		}
+
+		if !maps.Equal(previous.versions[itemType], next.versions[itemType]) {
+			w.notify(ctx, confignotify.Event{
+				Kind:    confignotify.DependenciesChanged,
+				Version: next.globalVersion,
+			})
 			return
 		}
 	}
 
-	for name, hash := range next["pipeline"] {
-		if prev, exists := previous["pipeline"][name]; !exists || prev != hash {
+	for name, version := range next.versions["pipeline"] {
+		previousVersion, exists := previous.versions["pipeline"][name]
+		if !exists || previousVersion != version {
 			w.notify(ctx, confignotify.Event{
 				Kind:     confignotify.PipelineChanged,
 				Pipeline: name,
+				Version:  version,
 			})
 		}
 	}
 
-	for name := range previous["pipeline"] {
-		if _, exists := next["pipeline"][name]; !exists {
+	for name := range previous.versions["pipeline"] {
+		if _, exists := next.versions["pipeline"][name]; !exists {
 			w.notify(ctx, confignotify.Event{
 				Kind:     confignotify.PipelineDeleted,
 				Pipeline: name,
+				Version:  next.globalVersion,
 			})
 		}
 	}

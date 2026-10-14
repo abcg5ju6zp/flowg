@@ -27,6 +27,13 @@ clustered backends) another node observed through a storage watcher.
 - **DependenciesChanged** — a transformer or forwarder changed, or the whole
   configuration was restored; subscribers should reconcile everything.
 
+Every event carries the global configuration `Version` committed with the
+change (`0` means "unknown" from a legacy producer). The bus is best-effort
+and never blocks a commit, so subscribers own idempotency: they ignore events
+at or below the version they already acknowledged. On FoundationDB the
+watcher emits version-stamped events from per-item version snapshots, so
+watch reconnections only surface versions the subscriber has not applied yet.
+
 ## Layout
 
 - **main.go** — the `Notifier` interface, its actor-backed implementation and
