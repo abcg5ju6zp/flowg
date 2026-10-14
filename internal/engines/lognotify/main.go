@@ -16,18 +16,30 @@ import (
 type LogNotifier interface {
 	// Subscribe registers the caller as a listener on a stream and returns a
 	// mailbox that receives every subsequent LogMessage for it. The subscription
-	// is torn down automatically when ctx is cancelled.
+	// is torn down automatically when ctx is cancelled. Subscribing to a
+	// stream closed by an in-progress purge fails with ErrStreamRetired.
 	Subscribe(ctx context.Context, stream string) (actor.MailboxReceiver[LogMessage], error)
 	// Notify broadcasts a freshly ingested record to every current subscriber of
-	// the stream; it is a no-op when nobody is listening.
+	// the stream; it is a no-op when nobody is listening. It also clears the
+	// stream's retired state, since a record can only be notified once a
+	// same-named stream exists again.
 	Notify(ctx context.Context, stream string, logKey string, logRecord models.LogRecord) error
+	// CloseStream retires a stream: existing subscribers receive a final
+	// terminated message carrying reason and new subscriptions are rejected
+	// until ReopenStream (or a new Notify) recreates the name. Used by the
+	// purge generation protocol.
+	CloseStream(ctx context.Context, stream, reason string) error
+	// ReopenStream clears the retired state of a stream after a same-named
+	// stream has been recreated.
+	ReopenStream(ctx context.Context, stream string) error
 }
 
 type logNotifierImpl struct {
 	actor.Actor
 
-	subMbox actor.MailboxSender[SubscribeMessage]
-	logMbox actor.MailboxSender[LogMessage]
+	subMbox     actor.MailboxSender[SubscribeMessage]
+	logMbox     actor.MailboxSender[LogMessage]
+	controlMbox actor.MailboxSender[StreamControlMessage]
 }
 
 var _ LogNotifier = (*logNotifierImpl)(nil)
@@ -71,22 +83,42 @@ func NewLogNotifier() fx.Option {
 
 			return mbox
 		}),
+		fx.Provide(func(lc fx.Lifecycle) actor.Mailbox[StreamControlMessage] {
+			mbox := actor.NewMailbox[StreamControlMessage]()
+
+			lc.Append(fx.Hook{
+				OnStart: func(ctx context.Context) error {
+					mbox.Start()
+					return nil
+				},
+				OnStop: func(ctx context.Context) error {
+					mbox.Stop()
+					return nil
+				},
+			})
+
+			return mbox
+		}),
 		fx.Provide(func(
 			lc fx.Lifecycle,
 			rootLogger *slog.Logger,
 			subMbox actor.Mailbox[SubscribeMessage],
 			logMbox actor.Mailbox[LogMessage],
+			controlMbox actor.Mailbox[StreamControlMessage],
 		) LogNotifier {
 			logNotifier := &logNotifierImpl{
 				Actor: actor.New(&worker{
 					logger:      rootLogger.With(slog.String("channel", "lognotify")),
 					subscribers: make(map[string]subscriberSet),
+					closed:      make(map[string]string),
 					subMbox:     subMbox,
 					logMbox:     logMbox,
+					controlMbox: controlMbox,
 				}),
 
-				subMbox: subMbox,
-				logMbox: logMbox,
+				subMbox:     subMbox,
+				logMbox:     logMbox,
+				controlMbox: controlMbox,
 			}
 
 			lc.Append(fx.Hook{
@@ -144,4 +176,24 @@ func (n *logNotifierImpl) Notify(ctx context.Context, stream string, logKey stri
 		LogRecord: logRecord,
 	}
 	return n.logMbox.Send(ctx, msg)
+}
+
+// CloseStream asks the actor to retire a stream, blocking until the control
+// message is queued: existing subscribers then receive a final terminated
+// message and new subscriptions are rejected with ErrStreamRetired.
+func (n *logNotifierImpl) CloseStream(ctx context.Context, stream, reason string) error {
+	return n.controlMbox.Send(ctx, StreamControlMessage{
+		Stream: stream,
+		Reason: reason,
+		Close:  true,
+	})
+}
+
+// ReopenStream clears the retired state of a stream after a same-named stream
+// has been recreated, so subscriptions succeed again.
+func (n *logNotifierImpl) ReopenStream(ctx context.Context, stream string) error {
+	return n.controlMbox.Send(ctx, StreamControlMessage{
+		Stream: stream,
+		Close:  false,
+	})
 }

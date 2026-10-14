@@ -32,3 +32,13 @@ func (m *MockNotifier) Notify(ctx context.Context, stream string, logKey string,
 	args := m.Called(ctx, stream, logKey, logRecord)
 	return args.Error(0)
 }
+
+func (m *MockNotifier) CloseStream(ctx context.Context, stream, reason string) error {
+	args := m.Called(ctx, stream, reason)
+	return args.Error(0)
+}
+
+func (m *MockNotifier) ReopenStream(ctx context.Context, stream string) error {
+	args := m.Called(ctx, stream)
+	return args.Error(0)
+}

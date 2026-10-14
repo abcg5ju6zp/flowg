@@ -30,6 +30,14 @@ func EstimateStorage(txn kv.QueryTx, stream string) (int64, error) {
 // from their running size estimate — so retention enforcement stays within the
 // backend's transaction size and time limits.
 func EvictOldestBatch(txn kv.MutationTx, stream string, toFree int64, limit int) (int64, int, error) {
+	// Retention GC never touches a stream being purged: an eviction
+	// interleaving the purge's stage deletions is exactly what used to leave
+	// index references without their entry behind. The purge itself clears
+	// the whole stream along its own generation boundary.
+	if err := EnsureWritable(txn, stream); err != nil {
+		return 0, 0, err
+	}
+
 	type victim struct {
 		key    kv.Key
 		record models.LogRecord

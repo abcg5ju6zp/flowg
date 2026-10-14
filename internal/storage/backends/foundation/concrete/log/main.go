@@ -8,6 +8,7 @@ import (
 	"github.com/vladopajic/go-actor/actor"
 	"go.uber.org/fx"
 
+	"link-society.com/flowg/internal/engines/lognotify"
 	"link-society.com/flowg/internal/models"
 
 	"link-society.com/flowg/internal/storage/backends/foundation"
@@ -37,9 +38,10 @@ type Options struct {
 type deps struct {
 	fx.In
 
-	Logger  *slog.Logger
-	Options Options
-	Adapter *foundation.FoundationAdapter `name:"storage.log"`
+	Logger      *slog.Logger
+	Options     Options
+	Adapter     *foundation.FoundationAdapter `name:"storage.log"`
+	LogNotifier lognotify.LogNotifier
 }
 
 // DefaultOptions returns the default [Options] for the log storage.
@@ -65,29 +67,35 @@ func (o Options) adapterOptions() foundation.AdapterOptions {
 
 // Module returns an fx module providing a FoundationDB-backed
 // [storage.LogStorage] configured by the [Options] provided to the graph. It
-// also starts a background worker that periodically enforces each stream's
-// retention budget.
+// starts a background worker that periodically enforces each stream's
+// retention budget and another that resumes interrupted stream retirement
+// generations, immediately at startup and then on every GC interval.
 func Module() fx.Option {
 	return fx.Module(
 		"storage.log",
 		foundation.NewAdapter("storage.log", Options.adapterOptions),
 		fx.Provide(func(lc fx.Lifecycle, d deps) storage.LogStorage {
-			storage := log.NewStorage(d.Logger, d.Adapter, d.Options.BatchSize, d.Options.StreamConfigOverride)
+			store := log.
+				NewStorage(d.Logger, d.Adapter, d.Options.BatchSize, d.Options.StreamConfigOverride).
+				WithTerminator(d.LogNotifier)
 
-			gc := actor.New(log.NewGarbageCollector(storage, d.Options.GCInterval))
+			gc := actor.New(log.NewGarbageCollector(store, d.Options.GCInterval))
+			recovery := actor.New(log.NewRetirementRecoveryWorker(store, d.Options.GCInterval))
 
 			lc.Append(fx.Hook{
 				OnStart: func(ctx context.Context) error {
 					gc.Start()
+					recovery.Start()
 					return nil
 				},
 				OnStop: func(ctx context.Context) error {
 					gc.Stop()
+					recovery.Stop()
 					return nil
 				},
 			})
 
-			return storage
+			return store
 		}),
 	)
 }

@@ -104,6 +104,10 @@ func NewStreamWatchCommand() *cobra.Command {
 						return
 					}
 
+				case "stream-retired":
+					fmt.Fprintf(os.Stderr, "Stream retired: %s\n", event.Data)
+					return
+
 				case "error":
 					fmt.Fprintf(os.Stderr, "ERROR: %s\n", event.Data)
 					ExitCode = 1

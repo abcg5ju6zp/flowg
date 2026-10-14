@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"net/http"
@@ -45,17 +46,23 @@ func NewGetStreamUsecase(deps GetStreamDeps) usecase.Interactor {
 				resp *schemas.GetStreamResponse,
 			) error {
 				config, err := deps.LogStorage.GetOrCreateStreamConfig(ctx, req.Stream)
-				if err != nil {
-					deps.Logger.ErrorContext(
-						ctx,
-						"Failed to get stream config",
-						slog.String("stream", req.Stream),
-						slog.String("error", err.Error()),
-					)
-
-					resp.Success = false
-					return status.Wrap(err, status.Internal)
+			if err != nil {
+				if errors.Is(err, storage.ErrStreamRetiring) {
+					// Do not lazily recreate a stream fenced by an
+					// in-progress purge.
+					return status.Wrap(err, status.FailedPrecondition)
 				}
+
+				deps.Logger.ErrorContext(
+					ctx,
+					"Failed to get stream config",
+					slog.String("stream", req.Stream),
+					slog.String("error", err.Error()),
+				)
+
+				resp.Success = false
+				return status.Wrap(err, status.Internal)
+			}
 
 				resp.Success = true
 				resp.Config = config
@@ -70,7 +77,7 @@ func NewGetStreamUsecase(deps GetStreamDeps) usecase.Interactor {
 	u.SetDescription("Get or Create Stream configuration")
 	u.SetTags("streams")
 
-	u.SetExpectedErrors(status.PermissionDenied, status.Internal)
+	u.SetExpectedErrors(status.PermissionDenied, status.FailedPrecondition, status.Internal)
 
 	return u
 }

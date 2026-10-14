@@ -2,6 +2,7 @@ package log
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 
@@ -30,6 +31,14 @@ type Storage[QTx kv.QueryTx, MTx kv.MutationTx] struct {
 	adapter              kv.Adapter[QTx, MTx]
 	batchSize            int
 	streamConfigOverride *models.StreamConfig
+
+	// gate fences streams being purged at the process level; the generation
+	// tombstones persisted by the transactions package fence them durably.
+	gate *retirementGate
+
+	// terminator, when set, receives CloseStream when a purge freezes a stream
+	// so live watchers get a definite termination reason.
+	terminator StreamTerminator
 }
 
 var _ storage.LogStorage = (*Storage[kv.QueryTx, kv.MutationTx])(nil)
@@ -55,6 +64,7 @@ func NewStorage[QTx kv.QueryTx, MTx kv.MutationTx](
 		adapter:              adapter,
 		batchSize:            batchSize,
 		streamConfigOverride: streamConfigOverride,
+		gate:                 newRetirementGate(),
 	}
 }
 
@@ -118,6 +128,15 @@ func (s *Storage[QTx, MTx]) GetOrCreateStreamConfig(ctx context.Context, stream 
 
 // ConfigureStream implements [storage.LogStorage].
 func (s *Storage[QTx, MTx]) ConfigureStream(ctx context.Context, stream string, config models.StreamConfig) error {
+	// A configuration change drives a multi-transaction index back-fill, so it
+	// is admitted like a writer: against a fenced stream it fails fast, and a
+	// purge waits for an admitted reconfiguration to finish rather than
+	// racing its index maintenance.
+	if err := s.gate.enter(stream); err != nil {
+		return err
+	}
+	defer s.gate.leave(stream)
+
 	var toIndex, toUnindex []string
 
 	err := s.adapter.Update(ctx, func(txn MTx) error {
@@ -144,31 +163,6 @@ func (s *Storage[QTx, MTx]) ConfigureStream(ctx context.Context, stream string, 
 	}
 
 	return nil
-}
-
-// DeleteStream implements [storage.LogStorage].
-func (s *Storage[QTx, MTx]) DeleteStream(ctx context.Context, stream string) error {
-	for {
-		var deleted int
-
-		err := s.adapter.Update(ctx, func(txn MTx) error {
-			var err error
-			deleted, err = transactions.DeleteStreamDataBatch(txn, stream, s.batchSize)
-			return err
-		})
-		if err != nil {
-			return err
-		}
-
-		if deleted == 0 {
-			break
-		}
-	}
-
-	// Clear the configuration last so an interrupted deletion can be resumed.
-	return s.adapter.Update(ctx, func(txn MTx) error {
-		return transactions.DeleteStreamConfig(txn, stream)
-	})
 }
 
 // StreamUsage implements [storage.LogStorage].
@@ -266,8 +260,31 @@ func (s *Storage[QTx, MTx]) CollectGarbage(ctx context.Context) error {
 			continue
 		}
 
-		var streamSize int64
+		// Normal GC never evicts from a stream being purged: the purge owns
+		// the stream's keys for its whole generation and deletes them itself.
+		var retiring bool
 		err := s.adapter.View(ctx, func(txn QTx) error {
+			rec, err := transactions.FetchRetirement(txn, stream)
+			if err != nil {
+				return err
+			}
+			retiring = rec != nil
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if retiring {
+			s.logger.DebugContext(
+				ctx,
+				"Skipping GC for retiring stream",
+				slog.String("stream", stream),
+			)
+			continue
+		}
+
+		var streamSize int64
+		err = s.adapter.View(ctx, func(txn QTx) error {
 			var err error
 			streamSize, err = transactions.EstimateStorage(txn, stream)
 			return err
@@ -290,6 +307,11 @@ func (s *Storage[QTx, MTx]) CollectGarbage(ctx context.Context) error {
 				return err
 			})
 			if err != nil {
+				// A purge fenced the stream between the skip-check and this
+				// batch: stop evicting it; the purge generation handles it.
+				if errors.Is(err, storage.ErrStreamRetiring) {
+					break
+				}
 				return err
 			}
 
@@ -322,8 +344,24 @@ func (s *Storage[QTx, MTx]) Distinct(ctx context.Context, stream string) (map[st
 
 // Ingest implements [storage.LogStorage].
 func (s *Storage[QTx, MTx]) Ingest(ctx context.Context, stream string, logRecord *models.LogRecord) (kv.Key, error) {
+	// Fast fence: once a purge owns the stream, newly arriving syslog/HTTP
+	// writes are rejected immediately; batches admitted before the fence were
+	// counted and the purge waits for them to finish.
+	if err := s.gate.enter(stream); err != nil {
+		return nil, err
+	}
+	defer s.gate.leave(stream)
+
 	key := newDbKey(stream, logRecord)
 	err := s.adapter.Update(ctx, func(txn MTx) error {
+		// Durable fence inside the write transaction: an operation that
+		// slipped past the in-memory gate is still refused, and its entry,
+		// field markers and index keys can never land after the purge passed
+		// the corresponding stage.
+		if err := transactions.EnsureWritable(txn, stream); err != nil {
+			return err
+		}
+
 		return transactions.Ingest(s.logger, txn, stream, logRecord, key, s.streamConfigOverride)
 	})
 	if err != nil {

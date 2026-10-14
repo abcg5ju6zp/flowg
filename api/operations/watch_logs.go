@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"encoding/json"
@@ -73,6 +74,12 @@ func NewWatchLogsUsecase(deps WatchLogsDeps) usecase.Interactor {
 
 				logM, err := deps.LogNotifier.Subscribe(ctx, req.Stream)
 				if err != nil {
+					if errors.Is(err, lognotify.ErrStreamRetired) {
+						// The stream is fenced by an in-progress purge: report
+						// a definite rejection rather than a 500.
+						return status.Wrap(err, status.FailedPrecondition)
+					}
+
 					deps.Logger.ErrorContext(
 						ctx,
 						"Failed to subscribe to logs",
@@ -102,6 +109,24 @@ func NewWatchLogsUsecase(deps WatchLogsDeps) usecase.Interactor {
 				)
 
 				for log := range logM.ReceiveC() {
+					// A purge retired the stream: emit one final, definite
+					// termination event with the reason and stop the stream.
+					if log.Terminated {
+						payload, err := json.Marshal(map[string]string{
+							"stream": req.Stream,
+							"reason": log.Reason,
+						})
+						if err != nil {
+							payload = []byte(`{"reason":"stream retired"}`)
+						}
+
+						fmt.Fprintf(resp.Writer, "event: stream-retired\n")
+						fmt.Fprintf(resp.Writer, "data: %s\n\n", payload)
+						resp.Writer.(http.Flusher).Flush()
+
+						return nil
+					}
+
 					matches := false
 
 					if filter == nil {
@@ -150,7 +175,7 @@ func NewWatchLogsUsecase(deps WatchLogsDeps) usecase.Interactor {
 	u.SetDescription("Server-Sent Events endpoint to watch logs in real time.")
 	u.SetTags("streams")
 
-	u.SetExpectedErrors(status.PermissionDenied, status.Internal)
+	u.SetExpectedErrors(status.PermissionDenied, status.FailedPrecondition, status.Internal)
 
 	return u
 }

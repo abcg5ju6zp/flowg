@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"link-society.com/flowg/api/routing"
 	"link-society.com/flowg/api/schemas"
 
+	"link-society.com/flowg/internal/engines/lognotify"
 	"link-society.com/flowg/internal/models"
 	storage "link-society.com/flowg/internal/storage/interfaces"
 )
@@ -27,6 +29,7 @@ type ConfigureStreamDeps struct {
 
 	AuthStorage storage.AuthStorage
 	LogStorage  storage.LogStorage
+	LogNotifier lognotify.LogNotifier
 }
 
 // NewConfigureStreamUsecase sets the retention and indexing configuration of a
@@ -45,30 +48,47 @@ func NewConfigureStreamUsecase(deps ConfigureStreamDeps) usecase.Interactor {
 				resp *schemas.ConfigureStreamResponse,
 			) error {
 				err := deps.LogStorage.ConfigureStream(ctx, req.Stream, req.Config)
-				if err != nil {
-					deps.Logger.ErrorContext(
-						ctx,
-						"Failed to configure stream",
-						slog.String("stream", req.Stream),
-						slog.String("error", err.Error()),
-					)
-
-					return status.Wrap(err, status.Internal)
+			if err != nil {
+				if errors.Is(err, storage.ErrStreamRetiring) {
+					// The stream is fenced by an in-progress purge.
+					return status.Wrap(err, status.FailedPrecondition)
 				}
 
-				resp.Success = true
+				deps.Logger.ErrorContext(
+					ctx,
+					"Failed to configure stream",
+					slog.String("stream", req.Stream),
+					slog.String("error", err.Error()),
+				)
 
-				return nil
-			},
-		),
-	)
+				return status.Wrap(err, status.Internal)
+			}
+
+			// A successful configure may (re)create a same-named stream
+			// after a purge: make it subscribable again, including while it
+			// still holds no records.
+			if err := deps.LogNotifier.ReopenStream(ctx, req.Stream); err != nil {
+				deps.Logger.WarnContext(
+					ctx,
+					"Failed to reopen stream watchers after configure",
+					slog.String("stream", req.Stream),
+					slog.String("error", err.Error()),
+				)
+			}
+
+			resp.Success = true
+
+			return nil
+		},
+	),
+)
 
 	u.SetName("configure_stream")
-	u.SetTitle("Configure Stream")
-	u.SetDescription("Configure Stream retention and indexes")
-	u.SetTags("streams")
+u.SetTitle("Configure Stream")
+u.SetDescription("Configure Stream retention and indexes")
+u.SetTags("streams")
 
-	u.SetExpectedErrors(status.PermissionDenied, status.Internal)
+	u.SetExpectedErrors(status.PermissionDenied, status.FailedPrecondition, status.Internal)
 
 	return u
 }

@@ -15,6 +15,7 @@ import (
 	"go.uber.org/fx/fxtest"
 
 	"link-society.com/flowg/cmd/flowg-server/logging"
+	"link-society.com/flowg/internal/engines/lognotify"
 	"link-society.com/flowg/internal/models"
 
 	badgerlog "link-society.com/flowg/internal/storage/backends/badger/concrete/log"
@@ -38,6 +39,7 @@ func newBatchedStorage(t *testing.T, batchSize int) (context.Context, storage.Lo
 		t,
 		fx.Supply(slog.New(slog.DiscardHandler)),
 		fx.Supply(opts),
+		lognotify.NewLogNotifier(),
 		badgerlog.Module(),
 		fx.Populate(&logStorage),
 		fx.NopLogger,

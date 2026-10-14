@@ -59,9 +59,19 @@ func FetchStreamFields(txn kv.QueryTx, stream string) []string {
 // GetOrCreateStreamConfig returns a stream's configuration, lazily creating an
 // empty (default) config the first time a stream is referenced so later writes
 // have something to update. A non-nil override short-circuits to that config.
+//
+// A stream fenced by an active retirement generation fails with
+// storage.ErrStreamRetiring, so a purge cannot be followed by a lazily
+// recreated config that would smuggle the old generation back. The first
+// write of a (re)created stream mints its generation token in the same
+// transaction.
 func GetOrCreateStreamConfig(txn kv.MutationTx, stream string, override *models.StreamConfig) (models.StreamConfig, error) {
 	if override != nil {
 		return *override, nil
+	}
+
+	if err := EnsureWritable(txn, stream); err != nil {
+		return models.StreamConfig{}, err
 	}
 
 	var streamConfig models.StreamConfig
@@ -83,6 +93,13 @@ func GetOrCreateStreamConfig(txn kv.MutationTx, stream string, override *models.
 				stream, err,
 			)
 		}
+	}
+
+	// Every live stream owns a generation token, minted at creation. Legacy
+	// streams (created before generations existed) are upgraded on first
+	// touch. The token is what stale cleanups compare themselves against.
+	if _, err := MintStreamGeneration(txn, stream); err != nil {
+		return models.StreamConfig{}, err
 	}
 
 	// If the value is empty, we treat it as a default config (the zero-value
@@ -124,9 +141,24 @@ func SaveStreamConfig(
 		config.IndexedFields = []string{}
 	}
 
+	// Reconfiguring a stream being purged is rejected outright, even when an
+	// override config short-circuits GetOrCreateStreamConfig.
+	if err := EnsureWritable(txn, stream); err != nil {
+		return nil, nil, err
+	}
+
 	oldConfig, err := GetOrCreateStreamConfig(txn, stream, override)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not fetch old stream config '%s': %w", stream, err)
+	}
+
+	// In override mode GetOrCreateStreamConfig does not persist anything, so
+	// make sure an explicitly (re)configured stream still owns a generation
+	// token distinct from any purged one.
+	if override != nil {
+		if _, err := MintStreamGeneration(txn, stream); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	streamKey := kv.Key{"stream", "config", stream}
@@ -154,51 +186,4 @@ func SaveStreamConfig(
 	return toIndex, toUnindex, nil
 }
 
-// DeleteStreamDataBatch deletes up to limit of a stream's data keys — its log
-// entries ("entry:<stream>:*"), inverted indexes ("index:<stream>:*") and field
-// markers ("stream:field:<stream>:*") — and reports how many it deleted. A count
-// of zero means all data is gone (the configuration key is removed separately by
-// [DeleteStreamConfig]). Callers loop until it returns zero so the work stays
-// within the backend's transaction limits.
-func DeleteStreamDataBatch(txn kv.MutationTx, stream string, limit int) (int, error) {
-	prefixes := []kv.Key{
-		{"entry", stream},
-		{"index", stream},
-		{"stream", "field", stream},
-	}
 
-	var keys []kv.Key
-	for _, prefix := range prefixes {
-		for key := range txn.IterKeys(prefix, kv.KeyRange{}) {
-			keys = append(keys, key)
-			if len(keys) >= limit {
-				break
-			}
-		}
-		if len(keys) >= limit {
-			break
-		}
-	}
-
-	for _, key := range keys {
-		if err := txn.Clear(key); err != nil {
-			return len(keys), fmt.Errorf(
-				"could not delete key '%s' from stream '%s': %w",
-				key, stream, err,
-			)
-		}
-	}
-
-	return len(keys), nil
-}
-
-// DeleteStreamConfig removes a stream's configuration key. It is cleared last,
-// after all the stream's data, so an interrupted deletion can be resumed.
-func DeleteStreamConfig(txn kv.MutationTx, stream string) error {
-	streamKey := kv.Key{"stream", "config", stream}
-	if err := txn.Clear(streamKey); err != nil {
-		return fmt.Errorf("could not delete stream config '%s': %w", stream, err)
-	}
-
-	return nil
-}

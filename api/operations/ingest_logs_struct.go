@@ -66,6 +66,13 @@ func NewIngestLogsStructUsecase(deps IngestLogsStructDeps) usecase.Interactor {
 							return status.Wrap(err, status.NotFound)
 						}
 
+						if errors.Is(err, storage.ErrStreamRetiring) {
+							// Target stream is fenced by an in-progress purge:
+							// reject the late write explicitly.
+							resp.Success = false
+							return status.Wrap(err, status.FailedPrecondition)
+						}
+
 						deps.Logger.DebugContext(
 							ctx,
 							"Failed to process log entry",
@@ -97,7 +104,7 @@ func NewIngestLogsStructUsecase(deps IngestLogsStructDeps) usecase.Interactor {
 	u.SetDescription("Run structured logs through a pipeline")
 	u.SetTags("pipelines")
 
-	u.SetExpectedErrors(status.PermissionDenied, status.NotFound, status.Internal)
+	u.SetExpectedErrors(status.PermissionDenied, status.NotFound, status.FailedPrecondition, status.Internal)
 
 	return u
 }
